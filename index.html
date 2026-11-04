@@ -38,15 +38,18 @@ nav button.on{color:var(--ink);border-bottom-color:var(--ink);font-weight:600}
 .pin{font-size:22px;line-height:1;text-shadow:0 0 3px #fff,0 0 3px #fff}
 .dim{opacity:.4;filter:grayscale(1)}
 video{width:100%;background:#D5DDE3;border-radius:6px;margin-top:8px}
+.badge{font-size:13px;font-weight:600;padding:3px 10px;border-radius:12px;white-space:nowrap}
+.b-still{background:#D8E6FF;color:#1D4FA8}.b-walk{background:#D5F2DC;color:#1E6B34}.b-maybe{background:#FFF1BF;color:#7A5A00}.b-drive{background:#2E8B57;color:#fff}
 .me{width:16px;height:16px;border-radius:50%;background:var(--go);border:3px solid #fff;box-shadow:0 0 0 2px var(--go)}
 </style>
 </head>
 <body>
 <header>
   <div class="cash" id="cash">$0</div>
+  <div class="badge b-still" id="move">🧍 Still</div>
   <div class="sub" id="status">Finding location</div>
 </header>
-<div id="lock">Moving. Dispatch is locked.<button class="btn" data-act="passenger">I am a passenger</button></div>
+<div id="lock">Driving. Dispatch is locked.<button class="btn" data-act="passenger">I am a passenger</button></div>
 <div id="map"></div>
 <div class="sheet">
   <nav>
@@ -71,8 +74,10 @@ const CONFIG = {
   ticketsPerUnit: 2,
   latePay: 0.5,                 // share of pay earned when the SLA is missed
   dividend: { amount: 20000, cooldownH: 24, minJobs: 3, belowUnits: 3, belowCash: 20000 },
-  moveLockMps: 3,
-  locationEveryMs: 120000,
+  locationEveryMs: 20000,       // how often to read the phone's cached location
+  fixMaxAgeMs: 30000,           // only accept cached fixes younger than this
+  driveMph: 25,                 // driving counts only above this speed
+  driveConfirmS: 120,           // and only after holding it this many seconds
   fallbackCenter: [36.1716, -115.1391],
   camMaxKm: 25,                 // camera install tickets only use real cameras within this distance
   camBreakPerHour: 0.02,        // chance per installed camera per hour that it breaks
@@ -263,13 +268,72 @@ function tick() {
   S.lastTick = now; Store.save(S); draw(now);
 }
 
-// Location. Uses the fix the phone already has when it is under ten minutes old.
+// Motion. Feels still, walking or driving from the phone's own sensors, with no location involved.
+const MO = { buf: [], gx: 0, gy: 0, gz: 0, gInit: false, mode: "idle", pending: "idle", n: 0, live: false, floor: 0.006 };
+function onMotion(e) {
+  const t = performance.now(), a = e.acceleration; let lx, ly, lz;
+  if (a && a.x !== null && a.y !== null && a.z !== null) { lx = a.x; ly = a.y; lz = a.z; }
+  else {
+    const g = e.accelerationIncludingGravity; if (!g || g.x === null) return;
+    if (!MO.gInit) { MO.gx = g.x; MO.gy = g.y; MO.gz = g.z; MO.gInit = true; }
+    MO.gx = 0.94 * MO.gx + 0.06 * g.x; MO.gy = 0.94 * MO.gy + 0.06 * g.y; MO.gz = 0.94 * MO.gz + 0.06 * g.z;
+    lx = g.x - MO.gx; ly = g.y - MO.gy; lz = g.z - MO.gz;
+  }
+  MO.live = true;
+  MO.buf.push({ t, m: Math.sqrt(lx * lx + ly * ly + lz * lz) / 9.81 });
+  while (MO.buf.length && t - MO.buf[0].t > 4000) MO.buf.shift();
+}
+function classifyMotion() {
+  const b = MO.buf, n = b.length; if (n < 40) return;
+  const rate = n / ((b[n - 1].t - b[0].t) / 1000);
+  let mean = 0; for (const x of b) mean += x.m; mean /= n;
+  let v = 0; for (const x of b) v += (x.m - mean) ** 2; const std = Math.sqrt(v / n);
+  let jerk = 0; for (let i = 1; i < n; i++) jerk += Math.abs(b[i].m - b[i - 1].m); const buzz = jerk / (n - 1);
+  let best = 0, bestLag = 0; const minLag = Math.round(rate * 0.28), maxLag = Math.round(rate * 0.85);
+  if (v > 0) for (let lag = minLag; lag <= maxLag && lag < n - 10; lag++) {
+    let c = 0; for (let i = 0; i + lag < n; i++) c += (b[i].m - mean) * (b[i + lag].m - mean);
+    c = c / ((n - lag) * (v / n)); if (c > best) { best = c; bestLag = lag; }
+  }
+  const cad = bestLag ? rate / bestLag : 0, f = MO.floor * 1.6;
+  const guess = std < f && buzz < f ? "idle" : best > 0.35 && std > 0.05 && cad >= 1.2 && cad <= 3.6 ? "walking" : best <= 0.35 ? "driving" : "walking";
+  if (guess === MO.pending) MO.n++; else { MO.pending = guess; MO.n = 1; }
+  if (MO.n >= 3) MO.mode = MO.pending;
+}
+window.addEventListener("devicemotion", onMotion, true);
+document.addEventListener("click", function askMotion() {
+  document.removeEventListener("click", askMotion);
+  if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") DeviceMotionEvent.requestPermission().catch(() => {});
+});
+
+// Movement badge. Motion sensors react in seconds; location confirms driving after holding the speed long enough.
+let FIXES = [], moveState = "still";
+function speedOver(sec) {
+  if (FIXES.length < 2) return null;
+  const last = FIXES[FIXES.length - 1];
+  if (Date.now() - last.t > 60000) return null;
+  for (let i = FIXES.length - 2; i >= 0; i--) {
+    const dt = (last.t - FIXES[i].t) / 1000;
+    if (dt >= sec) return meters([FIXES[i].lat, FIXES[i].lng], [last.lat, last.lng]) / dt;
+  }
+  return null;
+}
+function updateMove() {
+  const sp = speedOver(CONFIG.driveConfirmS), fast = sp !== null && sp >= CONFIG.driveMph * 0.44704;
+  const m = MO.live ? MO.mode : null;
+  if (fast && m !== "idle" && m !== "walking") moveState = "driving";
+  else if (m === "driving") moveState = "maybe";
+  else if (m === "walking" || (!MO.live && sp !== null && sp > 0.6)) moveState = "walking";
+  else moveState = "still";
+  S.moving = moveState === "driving";
+  if (!S.moving) S.passenger = false;
+}
+setInterval(() => { classifyMotion(); updateMove(); }, 500);
+
+// Location. Uses the fix the phone already has when it is fresh enough.
 function onFix(p) {
   const now = Date.now(), pt = { lat: p.coords.latitude, lng: p.coords.longitude, t: p.timestamp };
-  if (S.prev && pt.t > S.prev.t) {
-    const mps = meters([S.prev.lat, S.prev.lng], [pt.lat, pt.lng]) / ((pt.t - S.prev.t) / 1000);
-    S.moving = mps > CONFIG.moveLockMps; if (!S.moving) S.passenger = false;
-  }
+  if (!FIXES.length || pt.t > FIXES[FIXES.length - 1].t) FIXES.push(pt);
+  FIXES = FIXES.filter(f => now - f.t < 360000);
   const first = !S.player; S.prev = pt; S.player = pt;
   S.units.filter(u => u.state === "returning").forEach(u => startLeg(u, unitPt(u, now), playerPt(), now));
   if (first) map.setView(playerPt(), 13);
@@ -279,7 +343,7 @@ let locStatus = "Finding location";
 function locate() {
   if (!navigator.geolocation) { locStatus = "No location, using default"; return; }
   navigator.geolocation.getCurrentPosition(onFix, () => { locStatus = "Location off, using default"; },
-    { enableHighAccuracy: false, maximumAge: 600000, timeout: 10000 });
+    { enableHighAccuracy: false, maximumAge: CONFIG.fixMaxAgeMs, timeout: 10000 });
 }
 
 // Actions
@@ -310,6 +374,8 @@ let tab = "tickets", sel = null;
 function draw(now) {
   document.getElementById("cash").textContent = money(S.cash);
   document.getElementById("status").textContent = S.units.length + " crew, " + S.tickets.length + " tickets. " + locStatus;
+  const MV = { still: ["🧍", "Still", "b-still"], walking: ["🚶", "Walking", "b-walk"], maybe: ["🚗", "Driving?", "b-maybe"], driving: ["🚗", "Driving", "b-drive"] }[moveState];
+  const mb = document.getElementById("move"); mb.textContent = MV[0] + " " + MV[1]; mb.className = "badge " + MV[2];
   document.getElementById("lock").style.display = S.moving && !S.passenger ? "block" : "none";
   me.setLatLng(playerPt());
   const live = new Set();
