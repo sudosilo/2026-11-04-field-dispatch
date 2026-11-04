@@ -105,6 +105,7 @@ const THEME = {
     { key: "selfco",  label: "Self checkout fault",     icon: "🛒", needs: "pos",       mins: 90,  pay: 700,  slaH: 4,  w: 2 },
     { key: "camera",  label: "Camera install",          icon: "📷", needs: "camera",    mins: 105, pay: 1400, slaH: 24, w: 3 },
     { key: "camfix",  label: "Camera repair",           icon: "🔧", needs: "device",    mins: 40,  pay: 300,  slaH: 24, w: 0 },
+    { key: "alpr",    label: "Plate reader service",    icon: "🔍", needs: "camera",    mins: 75,  pay: 2400, slaH: 24, w: 2 },
     { key: "confav",  label: "Conference room AV",      icon: "🎤", needs: "av",        mins: 150, pay: 1800, slaH: 24, w: 2 },
     { key: "dish",    label: "Satellite dish install",  icon: "📡", needs: "satellite", mins: 120, pay: 1100, slaH: 24, w: 3 }
   ]
@@ -123,6 +124,7 @@ let S = Store.load() || {
 };
 S.cams = S.cams || {};
 S.scans = S.scans || {};
+S.declined = S.declined || { count: 0, sites: {} };
 
 // Live data. Real cameras from the Nevada roads feed and orbits for the satellite installers.
 let CAMS = [], SATS = [];
@@ -134,6 +136,13 @@ fetch("/api/sats").then(r => r.ok ? r.text() : "").then(t => {
   }
 }).catch(() => {});
 const camById = id => CAMS.find(c => c.id === id);
+// Plate readers. Known locations from public map data, any age. Contracts can be declined for good.
+let ALPRS = [], alprTile = "";
+function loadAlpr(p) {
+  const t = Math.floor(p[0] / 0.5) + ":" + Math.floor(p[1] / 0.5);
+  if (t === alprTile) return; alprTile = t;
+  fetch("/api/alpr?lat=" + p[0] + "&lng=" + p[1]).then(r => r.ok ? r.json() : []).then(d => { ALPRS = Array.isArray(d) ? d : []; }).catch(() => { alprTile = ""; });
+}
 // Site scans. One scan per 500 meter cell, kept in the save so the server is never asked twice.
 const cellOf = (lat, lng) => Math.floor(lat / 0.005) + ":" + Math.floor(lng / 0.005);
 function scanSite(k) {
@@ -227,13 +236,15 @@ function spawn(now, dtH) {
   if (anyOpen && Math.random() > Math.min(1, S.units.length * CONFIG.jobsPerUnitHour * dtH)) return;
   const tags = ownedTags();
   const freeCams = CAMS.filter(c => !S.cams[c.id] && !S.tickets.some(t => t.camId === c.id) && meters(playerPt(), [c.lat, c.lng]) <= CONFIG.camMaxKm * 1000);
-  const pool = THEME.jobs.filter(j => j.w > 0 && tags.has(j.needs) && (j.key !== "camera" || freeCams.length));
+  const freeAlpr = ALPRS.filter(a => !S.declined.sites[a.id] && !S.tickets.some(t => t.alprId === a.id) && meters(playerPt(), [a.lat, a.lng]) <= CONFIG.camMaxKm * 1000);
+  const pool = THEME.jobs.filter(j => j.w > 0 && tags.has(j.needs) && (j.key !== "camera" || freeCams.length) && (j.key !== "alpr" || freeAlpr.length));
   if (!pool.length) return;
   let r = Math.random() * pool.reduce((a, j) => a + j.w, 0), job = pool[0];
   for (const j of pool) { r -= j.w; if (r <= 0) { job = j; break; } }
   const cam = job.key === "camera" ? freeCams[Math.floor(Math.random() * freeCams.length)] : null;
-  const p = cam ? [cam.lat, cam.lng] : randomNear(playerPt());
-  S.tickets.push({ id: S.nextId++, key: job.key, lat: p[0], lng: p[1], created: now, camId: cam ? cam.id : null,
+  const alpr = job.key === "alpr" ? freeAlpr[Math.floor(Math.random() * freeAlpr.length)] : null;
+  const p = cam ? [cam.lat, cam.lng] : alpr ? [alpr.lat, alpr.lng] : randomNear(playerPt());
+  S.tickets.push({ id: S.nextId++, key: job.key, lat: p[0], lng: p[1], created: now, camId: cam ? cam.id : null, alprId: alpr ? alpr.id : null,
     deadline: now + job.slaH * 3600000 / CONFIG.timeScale, status: "open" });
 }
 function breakdowns(now, dtH) {
@@ -361,6 +372,7 @@ function onFix(p) {
   const first = !S.player; S.prev = pt; S.player = pt;
   S.units.filter(u => u.state === "returning" && meters(u.leg.to, playerPt()) > 300).forEach(u => startLeg(u, unitPt(u, now), playerPt(), now));
   if (first) map.setView(playerPt(), 13);
+  loadAlpr(playerPt());
   locStatus = "Location " + dur(now - pt.t) + " old";
 }
 let locStatus = "Finding location";
@@ -445,6 +457,7 @@ function ticketsHtml(now) {
       h += ok.length ? ok.map(u => '<button class="btn main" data-act="send" data-u="' + u.id + '" data-t="' + t.id + '"' + (locked ? " disabled" : "") +
         ">Send " + THEME.units[u.type].label + ", " + etaText(u, playerPt(), [t.lat, t.lng]) + "</button>").join("")
         : '<div class="meta">No crew with you can take this job.</div>';
+      if (t.key === "alpr") h += '<button class="btn" data-act="decline" data-t="' + t.id + '">Decline contract</button>';
     }
     return h + "</div>";
   }).join("");
@@ -483,7 +496,8 @@ function drawCams(P) {
   }
 }
 function shopHtml() {
-  return '<div class="row"><button class="btn" data-act="restart">Restart game</button></div>' + Object.entries(THEME.units).map(([k, T]) => '<div class="row"><h3>' + T.icon + " " + T.label + "</h3>" +
+  return '<div class="row">' + (S.declined.count ? '<div class="meta">Plate reader contracts declined: ' + S.declined.count + "</div>" : "") +
+    '<button class="btn" data-act="restart">Restart game</button></div>' + Object.entries(THEME.units).map(([k, T]) => '<div class="row"><h3>' + T.icon + " " + T.label + "</h3>" +
     '<div class="meta">' + money(T.price) + " to hire. Wage " + money(T.wage) + " an hour.</div>" +
     '<button class="btn" data-act="buy" data-k="' + k + '"' + (S.cash < T.price ? " disabled" : "") + ">Hire</button></div>").join("");
 }
@@ -497,12 +511,18 @@ document.body.addEventListener("click", e => {
   if (a === "buy") buy(b.dataset.k);
   else if (a === "send") { e.stopPropagation(); dispatch(+b.dataset.u, +b.dataset.t); }
   else if (a === "passenger") { S.passenger = true; tick(); }
+  else if (a === "decline") {
+    e.stopPropagation();
+    const t = S.tickets.find(x => x.id === +b.dataset.t);
+    if (t) { S.declined.count++; S.declined.sites[t.alprId] = 1; S.tickets = S.tickets.filter(x => x.id !== t.id); sel = null; toast("Contract declined. That site will not be offered again."); tick(); }
+  }
   else if (a === "watch") { watching = watching === b.dataset.c ? null : b.dataset.c; camsKey = ""; draw(Date.now()); }
   else if (a === "restart") { if (confirm("Wipe this game and start over with the grant?")) { try { localStorage.removeItem(KEY); } catch (e) {} location.reload(); } }
   else if (a === "select") { const id = +b.dataset.id; sel = sel === id ? null : id; const t = S.tickets.find(x => x.id === id); if (t) { map.panTo([t.lat, t.lng]); getRoute(playerPt(), [t.lat, t.lng]).then(() => draw(Date.now())); } draw(Date.now()); }
 });
 
 if (S.player) map.setView(playerPt(), 13);
+loadAlpr(playerPt());
 S.units.forEach(u => {
   const leg = u.leg; if (!leg || leg.path) return;
   getRoute(leg.from, leg.to).then(r => { if (r && u.leg === leg) { leg.path = r.path; leg.cum = r.cum; leg.end = leg.start + r.dur * 1000 / CONFIG.timeScale; } });
