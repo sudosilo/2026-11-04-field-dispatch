@@ -183,9 +183,33 @@ function unitPt(u, now) {
   if (u.state === "idle") return playerPt();
   if (u.state === "onsite") { const t = S.tickets.find(k => k.id === u.ticketId); return t ? [t.lat, t.lng] : playerPt(); }
   const L = u.leg, f = Math.min(1, Math.max(0, (now - L.start) / (L.end - L.start || 1)));
+  if (L.path && L.cum) {
+    const d = f * L.cum[L.cum.length - 1]; let i = 1;
+    while (i < L.cum.length - 1 && L.cum[i] < d) i++;
+    const a = L.path[i - 1], b = L.path[i], g = (d - L.cum[i - 1]) / ((L.cum[i] - L.cum[i - 1]) || 1);
+    return [a[0] + (b[0] - a[0]) * g, a[1] + (b[1] - a[1]) * g];
+  }
   return [L.from[0] + (L.to[0] - L.from[0]) * f, L.from[1] + (L.to[1] - L.from[1]) * f];
 }
-function startLeg(u, from, to, t) { u.leg = { from, to, start: t, end: t + travelMs(u, from, to) }; }
+// Roads. Each leg starts as a straight line estimate, then snaps to the real road route once it arrives.
+const ROUTES = {};
+const routeKey = (a, b) => a[0].toFixed(4) + "," + a[1].toFixed(4) + ";" + b[0].toFixed(4) + "," + b[1].toFixed(4);
+function getRoute(a, b) {
+  const k = routeKey(a, b);
+  if (!ROUTES[k]) ROUTES[k] = fetch("/api/route?from=" + a[0] + "," + a[1] + "&to=" + b[0] + "," + b[1])
+    .then(r => r.ok ? r.json() : null).then(d => {
+      if (!d || !d.path || d.path.length < 2) { delete ROUTES[k]; return null; }
+      const cum = [0]; for (let i = 1; i < d.path.length; i++) cum.push(cum[i - 1] + meters(d.path[i - 1], d.path[i]));
+      d.cum = cum; ROUTES[k].done = d; return d;
+    }).catch(() => { delete ROUTES[k]; return null; });
+  return ROUTES[k];
+}
+const routeNow = (a, b) => { const p = ROUTES[routeKey(a, b)]; return p && p.done; };
+function startLeg(u, from, to, t) {
+  const leg = { from, to, start: t, end: t + travelMs(u, from, to), path: null, cum: null };
+  u.leg = leg;
+  getRoute(from, to).then(r => { if (r && u.leg === leg) { leg.path = r.path; leg.cum = r.cum; leg.end = leg.start + r.dur * 1000 / CONFIG.timeScale; } });
+}
 function randomNear(c) {
   const km = CONFIG.spawnKm[0] + Math.random() * (CONFIG.spawnKm[1] - CONFIG.spawnKm[0]);
   const b = Math.random() * 2 * Math.PI, dLat = km / 111.32 * Math.cos(b);
@@ -335,7 +359,7 @@ function onFix(p) {
   if (!FIXES.length || pt.t > FIXES[FIXES.length - 1].t) FIXES.push(pt);
   FIXES = FIXES.filter(f => now - f.t < 360000);
   const first = !S.player; S.prev = pt; S.player = pt;
-  S.units.filter(u => u.state === "returning").forEach(u => startLeg(u, unitPt(u, now), playerPt(), now));
+  S.units.filter(u => u.state === "returning" && meters(u.leg.to, playerPt()) > 300).forEach(u => startLeg(u, unitPt(u, now), playerPt(), now));
   if (first) map.setView(playerPt(), 13);
   locStatus = "Location " + dur(now - pt.t) + " old";
 }
@@ -363,7 +387,7 @@ function dispatch(unitId, ticketId) {
 const map = L.map("map", { zoomControl: false }).setView(CONFIG.fallbackCenter, 12);
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(map);
 const me = L.marker(CONFIG.fallbackCenter, { icon: L.divIcon({ className: "", html: '<div class="me"></div>', iconSize: [22, 22] }) }).addTo(map);
-const marks = {};
+const marks = {}, lines = {};
 function pin(id, pt, icon, dim) {
   if (!marks[id]) {
     marks[id] = L.marker(pt, { icon: L.divIcon({ className: "", html: '<div class="pin' + (dim ? " dim" : "") + '">' + icon + "</div>", iconSize: [24, 24] }) }).addTo(map);
@@ -391,6 +415,16 @@ function draw(now) {
     if (a) { const id = "s" + u.id; live.add(id); pin(id, [a.lat, a.lng], "🛰️"); }
   });
   Object.keys(marks).forEach(id => { if (!live.has(id)) { map.removeLayer(marks[id]); delete marks[id]; } });
+  const liveLines = new Set();
+  S.units.filter(u => u.leg && u.leg.path).forEach(u => {
+    const id = "l" + u.id; liveLines.add(id);
+    if (!lines[id] || lines[id].src !== u.leg.path) {
+      if (lines[id]) map.removeLayer(lines[id]);
+      lines[id] = L.polyline(u.leg.path, { color: u.state === "returning" ? "#5B6B7A" : "#1F6FEB", weight: 4, opacity: 0.55, dashArray: u.state === "returning" ? "6 6" : null }).addTo(map);
+      lines[id].src = u.leg.path;
+    }
+  });
+  Object.keys(lines).forEach(id => { if (!liveLines.has(id)) { map.removeLayer(lines[id]); delete lines[id]; } });
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
   const P = document.getElementById("pane"), top = P.scrollTop;
   if (tab === "cams") { drawCams(P); return; }
@@ -409,11 +443,15 @@ function ticketsHtml(now) {
     if (sel === t.id && t.status === "open") {
       const ok = S.units.filter(u => u.state === "idle" && THEME.units[u.type].tags.includes(j.needs));
       h += ok.length ? ok.map(u => '<button class="btn main" data-act="send" data-u="' + u.id + '" data-t="' + t.id + '"' + (locked ? " disabled" : "") +
-        ">Send " + THEME.units[u.type].label + ", " + dur(travelMs(u, playerPt(), [t.lat, t.lng])) + "</button>").join("")
+        ">Send " + THEME.units[u.type].label + ", " + etaText(u, playerPt(), [t.lat, t.lng]) + "</button>").join("")
         : '<div class="meta">No crew with you can take this job.</div>';
     }
     return h + "</div>";
   }).join("");
+}
+function etaText(u, a, b) {
+  const r = routeNow(a, b);
+  return r ? dur(r.dur * 1000 / CONFIG.timeScale) + " by road" : "about " + dur(travelMs(u, a, b));
 }
 function crewHtml(now) {
   if (!S.units.length) return '<div class="empty">No crew yet. Hire one in the Shop.</div>';
@@ -461,10 +499,14 @@ document.body.addEventListener("click", e => {
   else if (a === "passenger") { S.passenger = true; tick(); }
   else if (a === "watch") { watching = watching === b.dataset.c ? null : b.dataset.c; camsKey = ""; draw(Date.now()); }
   else if (a === "restart") { if (confirm("Wipe this game and start over with the grant?")) { try { localStorage.removeItem(KEY); } catch (e) {} location.reload(); } }
-  else if (a === "select") { const id = +b.dataset.id; sel = sel === id ? null : id; const t = S.tickets.find(x => x.id === id); if (t) map.panTo([t.lat, t.lng]); draw(Date.now()); }
+  else if (a === "select") { const id = +b.dataset.id; sel = sel === id ? null : id; const t = S.tickets.find(x => x.id === id); if (t) { map.panTo([t.lat, t.lng]); getRoute(playerPt(), [t.lat, t.lng]).then(() => draw(Date.now())); } draw(Date.now()); }
 });
 
 if (S.player) map.setView(playerPt(), 13);
+S.units.forEach(u => {
+  const leg = u.leg; if (!leg || leg.path) return;
+  getRoute(leg.from, leg.to).then(r => { if (r && u.leg === leg) { leg.path = r.path; leg.cum = r.cum; leg.end = leg.start + r.dur * 1000 / CONFIG.timeScale; } });
+});
 locate(); setInterval(locate, CONFIG.locationEveryMs);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { locate(); tick(); } });
 tick(); setInterval(tick, 1000);
