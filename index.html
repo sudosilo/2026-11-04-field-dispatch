@@ -143,7 +143,8 @@ function spawn(now, dtH) {
   if (!S.units.length) return;
   const cap = CONFIG.baseTickets + CONFIG.ticketsPerUnit * S.units.length;
   if (S.tickets.filter(t => t.status === "open").length >= cap) return;
-  if (Math.random() > Math.min(1, S.units.length * CONFIG.jobsPerUnitHour * dtH)) return;
+  const anyOpen = S.tickets.some(t => t.status === "open");
+  if (anyOpen && Math.random() > Math.min(1, S.units.length * CONFIG.jobsPerUnitHour * dtH)) return;
   const tags = ownedTags(), pool = THEME.jobs.filter(j => tags.has(j.needs));
   let r = Math.random() * pool.reduce((a, j) => a + j.w, 0), job = pool[0];
   for (const j of pool) { r -= j.w; if (r <= 0) { job = j; break; } }
@@ -273,7 +274,7 @@ function crewHtml(now) {
     const T = THEME.units[u.type];
     const left = u.state === "onsite" ? "Done in " + dur(u.workEnd - now) : u.leg ? "Arrives in " + dur(u.leg.end - now) : "";
     return '<div class="row"><h3>' + T.icon + " " + T.label + '</h3><div class="meta"><span class="tag t-' + u.state + '">' +
-      words[u.state] + "</span>" + left + ". Wage " + money(T.wage) + " an hour.</div></div>";
+      words[u.state] + "</span>" + (left ? left + ". " : "") + "Wage " + money(T.wage) + " an hour.</div></div>";
   }).join("");
 }
 function shopHtml() {
