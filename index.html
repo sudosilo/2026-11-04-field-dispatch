@@ -117,6 +117,7 @@ let S = Store.load() || {
   jobsDone: 0, lastDividend: 0, nextId: 1, prev: null, moving: false, passenger: false, cams: {}
 };
 S.cams = S.cams || {};
+S.scans = S.scans || {};
 
 // Live data. Real cameras from the Nevada roads feed and orbits for the satellite installers.
 let CAMS = [], SATS = [];
@@ -128,6 +129,19 @@ fetch("/api/sats").then(r => r.ok ? r.text() : "").then(t => {
   }
 }).catch(() => {});
 const camById = id => CAMS.find(c => c.id === id);
+// Site scans. One scan per 500 meter cell, kept in the save so the server is never asked twice.
+const cellOf = (lat, lng) => Math.floor(lat / 0.005) + ":" + Math.floor(lng / 0.005);
+function scanSite(k) {
+  const c = cellOf(k.lat, k.lng), have = S.scans[c];
+  if (have && have.networks !== undefined) return;
+  fetch("/api/scan?lat=" + k.lat + "&lng=" + k.lng).then(r => r.json()).then(d => { if (d && d.networks !== undefined) S.scans[c] = d; }).catch(() => {});
+}
+function scanText(k) {
+  const d = k && S.scans[cellOf(k.lat, k.lng)];
+  if (!d) return "";
+  const open = (d.encryption.none || 0) + (d.encryption.wep || 0), top = d.busiestChannels[0];
+  return "Site scan: " + d.networks + " networks nearby, " + open + " open or weak" + (top ? ", busiest channel " + top.channel : "") + ". ";
+}
 function satAt(sat, date, site) {
   const pv = satellite.propagate(sat.rec, date);
   if (!pv || !pv.position) return null;
@@ -220,6 +234,7 @@ function stepUnit(u, now) {
       const job = jobByKey[S.tickets.find(k => k.id === u.ticketId).key];
       const k = S.tickets.find(x => x.id === u.ticketId);
       u.state = "onsite"; u.workEnd = u.leg.end + job.mins * 60000 / CONFIG.timeScale; u.leg = null; u.pass = null;
+      scanSite(k);
       if (job.key === "dish") { const ps = nextPass([k.lat, k.lng], u.workEnd); if (ps) { u.workEnd = ps.t; u.pass = ps.name; } }
       continue;
     }
@@ -341,7 +356,7 @@ function crewHtml(now) {
     const T = THEME.units[u.type];
     const left = u.state === "onsite" ? (u.pass ? "Waiting for " + u.pass + " to pass overhead, done in " : "Done in ") + dur(u.workEnd - now) : u.leg ? "Arrives in " + dur(u.leg.end - now) : "";
     return '<div class="row"><h3>' + T.icon + " " + T.label + '</h3><div class="meta"><span class="tag t-' + u.state + '">' +
-      words[u.state] + "</span>" + (left ? left + ". " : "") + "Wage " + money(T.wage) + " an hour.</div></div>";
+      words[u.state] + "</span>" + (left ? left + ". " : "") + (u.state === "onsite" ? scanText(S.tickets.find(x => x.id === u.ticketId)) : "") + "Wage " + money(T.wage) + " an hour.</div></div>";
   }).join("");
 }
 let watching = null, camsKey = "";
